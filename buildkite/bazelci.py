@@ -31,11 +31,13 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+from github3 import login
 from urllib.request import url2pathname
 from urllib.parse import urlparse
 
 # Initialize the random number generator.
 random.seed()
+
 
 class BuildkiteException(Exception):
     """
@@ -55,6 +57,13 @@ class BinaryUploadRaceException(Exception):
 class BazelTestFailedException(Exception):
     """
     Raised when a Bazel test fails.
+    """
+    pass
+
+
+class BazelTestFailedException(Exception):
+    """
+    Raised when a Bazel build fails.
     """
     pass
 
@@ -277,11 +286,11 @@ def fetch_configs(http_url):
 
 
 def print_collapsed_group(name):
-    eprint("\n--- {0}\n".format(name))
+    eprint("\n\n--- {0}\n\n".format(name))
 
 
 def print_expanded_group(name):
-    eprint("\n+++ {0}\n".format(name))
+    eprint("\n\n+++ {0}\n\n".format(name))
 
 
 def execute_commands(config, platform, git_repository, use_but, save_but,
@@ -289,9 +298,14 @@ def execute_commands(config, platform, git_repository, use_but, save_but,
     fail_pipeline = False
     tmpdir = None
     bazel_binary = "bazel"
+    commit = os.getenv("BUILDKITE_COMMIT")
     try:
         if git_repository:
             clone_git_repository(git_repository, platform)
+        else:
+            git_repository = os.getenv("BUILDKITE_REPO")
+        if is_pull_request():
+            update_pull_request_verification_status(git_repository, commit, state="success")
         cleanup()
         tmpdir = tempfile.mkdtemp()
         if use_but:
@@ -301,24 +315,56 @@ def execute_commands(config, platform, git_repository, use_but, save_but,
         execute_shell_commands(config.get("shell_commands", None))
         execute_bazel_run(bazel_binary, config.get("run_targets", None))
         if not test_only:
-            execute_bazel_build(bazel_binary, platform, config.get("build_flags", []),
-                                config.get("build_targets", None))
-            if save_but:
-                upload_bazel_binary()
-        if not build_only:
-            bep_file = os.path.join(tmpdir, "build_event_json_file.json")
+            build_bep_file = os.path.join(tmpdir, "build_bep.json")
+            if is_pull_request():
+                update_pull_request_build_status(
+                    platform, git_repository, commit, "pending", None)
             try:
+                execute_bazel_build(bazel_binary, platform, config.get("build_flags", []),
+                                    config.get("build_targets", None), build_bep_file)
+                if is_pull_request():
+                    invocation_id = bes_invocation_id(build_bep_file)
+                    update_pull_request_build_status(
+                        platform, git_repository, commit, "success", invocation_id)
+                if save_but:
+                    upload_bazel_binary()
+            except BazelBuildFailedException:
+                if is_pull_request():
+                    invocation_id = bes_invocation_id(build_bep_file)
+                    update_pull_request_build_status(
+                        platform, git_repository, commit, "failure", invocation_id)
+                fail_pipeline = True
+        if not fail_pipeline and not build_only:
+            test_bep_file = os.path.join(tmpdir, "test_bep.json")
+            try:
+                if is_pull_request():
+                    update_pull_request_test_status(
+                        platform, git_repository, commit, "pending", None)
                 execute_bazel_test(bazel_binary, platform, config.get("test_flags", []),
-                                   config.get("test_targets", None), bep_file)
+                                   config.get("test_targets", None), test_bep_file)
+                if has_flaky_tests(test_bep_file):
+                    show_image(flaky_test_meme_url(), "Flaky Tests")
+                    # We also treat flaky tests as test failures
+                    raise BazelTestFailedException
+                if is_pull_request():
+                    invocation_id = bes_invocation_id(test_bep_file)
+                    update_pull_request_test_status(
+                        platform, git_repository, commit, "success", invocation_id)
             except BazelTestFailedException:
-                fail_pipeline = True
-            print_test_summary(bep_file)
+                if is_pull_request():
+                    invocation_id = bes_invocation_id(test_bep_file)
+                    failed_tests = tests_with_status(
+                        test_bep_file, status="FAILED")
+                    timed_out_tests = tests_with_status(
+                        test_bep_file, status="TIMEOUT")
+                    flaky_tests = tests_with_status(
+                        test_bep_file, status="FLAKY")
 
-            # Fail the pipeline if there were any flaky tests.
-            if has_flaky_tests(bep_file):
+                    update_pull_request_test_status(platform, git_repository, commit, "failure", invocation_id,
+                                                    len(failed_tests), len(timed_out_tests), len(flaky_tests))
                 fail_pipeline = True
 
-            upload_test_logs(bep_file, tmpdir)
+            upload_test_logs(test_bep_file, tmpdir)
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir)
@@ -328,27 +374,118 @@ def execute_commands(config, platform, git_repository, use_but, save_but,
         raise BuildkiteException("At least one test failed or was flaky.")
 
 
+def tests_with_status(bep_file, status):
+    return set(label for label, _ in test_logs_for_status(bep_file, status=status))
+
+
+__github_token__ = None
+
+
+def fetch_github_token():
+    global __github_token__
+    if __github_token__:
+        return __github_token__
+    try:
+        execute_command(
+            ["gsutil", "cp", "gs://bazel-encrypted-secrets/github-token.enc", "github-token.enc"])
+        __github_token__ = subprocess.check_output(["gcloud", "kms", "decrypt", "--location", "global", "--keyring", "buildkite",
+                                                    "--key", "github-token", "--ciphertext-file", "github-token.enc",
+                                                    "--plaintext-file", "-"]).decode("utf-8").strip()
+        return __github_token__
+    finally:
+        os.remove("github-token.enc")
+
+
+def owner_repository_from_url(git_repository):
+    m = re.search(r"/([^/]+)/([^/]+)\.git$", git_repository)
+    owner = m.group(1)
+    repository = m.group(2)
+    return (owner, repository)
+
+
+def results_view_url(invocation_id):
+    results_url = None
+    if invocation_id:
+        results_url = "https://source.cloud.google.com/results/invocations/" + invocation_id
+    return results_url
+
+
+def update_pull_request_status(git_repository, commit, state, details_url, description, context):
+    gh = login(token=fetch_github_token())
+    owner, repo = owner_repository_from_url(git_repository)
+    repo = gh.repository(owner=owner, repository=repo)
+    repo.create_status(sha=commit, state=state, target_url=details_url, description=description,
+                       context=context)
+
+
+def update_pull_request_verification_status(git_repository, commit, state):
+    description = ""
+    if state == "pending":
+        description = "A project member must verify this pull request."
+    elif state == "success":
+        description = "Verified"
+    build_url = os.getenv("BUILDKITE_BUILD_URL")
+    update_pull_request_status(git_repository, commit, state, build_url, description,
+                               "Untrusted Code Verification")
+
+
+def update_pull_request_build_status(platform, git_repository, commit, state, invocation_id):
+    description = ""
+    if state == "pending":
+        description = "Building ..."
+    elif state == "failure":
+        description = "Failure"
+    elif state == "success":
+        description = "Success"
+    update_pull_request_status(git_repository, commit, state, results_view_url(invocation_id), description,
+                               "bazel build ({0})".format(platforms_info()[platform]["name"]))
+
+
+def update_pull_request_test_status(platform, git_repository, commit, state, invocation_id, num_failed=0,
+                                    num_timed_out=0, num_flaky=0):
+    description = ""
+    if state == "pending":
+        description = "Testing ..."
+    elif state == "failure":
+        if failed > 0:
+            description = description + "{0} tests failed, ".format(num_failed)
+        if num_timed_out > 0:
+            description = description + "{0} tests timed out, ".format(num_timed_out)
+        if num_flaky > 0:
+            description = description + "{0} tests are flaky, ".format(num_flaky)
+        if len(description) > 0:
+            description = description[:-2]
+        else:
+            description = "Some tests didn't pass"
+    elif state == "success":
+        description = "All tests passed"
+    update_pull_request_status(git_repository, commit, state, results_view_url(invocation_id), description,
+                               "bazel test ({0})".format(platforms_info()[platform]["name"]))
+
+
+def is_pull_request():
+    third_party_repo = os.getenv("BUILDKITE_PULL_REQUEST_REPO", "")
+    return len(third_party_repo) > 0
+
+
+def bes_invocation_id(bep_file):
+    targets = []
+    raw_data = ""
+    with open(bep_file) as f:
+        raw_data = f.read()
+    decoder = json.JSONDecoder()
+
+    pos = 0
+    while pos < len(raw_data):
+        bep_obj, size = decoder.raw_decode(raw_data[pos:])
+        if "started" in bep_obj:
+            return bep_obj["started"]["uuid"]
+        pos += size + 1
+    return None
+
+
 def show_image(url, alt):
     eprint("\033]1338;url='\"{0}\"';alt='\"{1}\"'\a\n".format(url, alt))
-
-
-def print_test_summary(bep_file):
-    failed = test_logs_for_status(bep_file, status="FAILED")
-    if failed:
-        print_expanded_group("Failed Tests")
-        for label, _ in failed:
-            eprint(label)
-    timed_out = test_logs_for_status(bep_file, status="TIMEOUT")
-    if timed_out:
-        print_expanded_group("Timed out Tests")
-        for label, _ in timed_out:
-            eprint(label)
-    flaky = test_logs_for_status(bep_file, status="FLAKY")
-    if flaky:
-        print_expanded_group("Flaky Tests")
-        show_image(flaky_test_meme_url(), "Flaky Tests")
-        for label, _ in flaky:
-            eprint(label)
 
 
 def has_flaky_tests(bep_file):
@@ -363,7 +500,8 @@ def print_bazel_version_info(bazel_binary):
 
 def upload_bazel_binary():
     print_collapsed_group("Uploading Bazel under test")
-    execute_command(["buildkite-agent", "artifact", "upload", "bazel-bin/src/bazel"])
+    execute_command(["buildkite-agent", "artifact",
+                     "upload", "bazel-bin/src/bazel"])
 
 
 def download_bazel_binary(dest_dir, platform):
@@ -385,21 +523,27 @@ def clone_git_repository(git_repository, platform):
         os.chdir(clone_path)
         execute_command(["git", "remote", "set-url", "origin", git_repository])
         execute_command(["git", "clean", "-fdqx"])
-        execute_command(["git", "submodule", "foreach", "--recursive", "git", "clean", "-fdqx"])
+        execute_command(["git", "submodule", "foreach",
+                         "--recursive", "git", "clean", "-fdqx"])
         # sync to the latest commit of HEAD. Unlikely git pull this also works after
         # a force push.
         execute_command(["git", "fetch", "origin"])
-        remote_head = subprocess.check_output(["git", "symbolic-ref", "refs/remotes/origin/HEAD"])
+        remote_head = subprocess.check_output(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"])
         remote_head = remote_head.decode("utf-8")
         remote_head = remote_head.rstrip()
         execute_command(["git", "reset", remote_head, "--hard"])
         execute_command(["git", "submodule", "sync", "--recursive"])
-        execute_command(["git", "submodule", "update", "--init", "--recursive", "--force"])
-        execute_command(["git", "submodule", "foreach", "--recursive", "git", "reset", "--hard"])
+        execute_command(["git", "submodule", "update",
+                         "--init", "--recursive", "--force"])
+        execute_command(["git", "submodule", "foreach",
+                         "--recursive", "git", "reset", "--hard"])
         execute_command(["git", "clean", "-fdqx"])
-        execute_command(["git", "submodule", "foreach", "--recursive", "git", "clean", "-fdqx"])
+        execute_command(["git", "submodule", "foreach",
+                         "--recursive", "git", "clean", "-fdqx"])
     else:
-        execute_command(["git", "clone", "--recurse-submodules", git_repository, clone_path])
+        execute_command(
+            ["git", "clone", "--recurse-submodules", git_repository, clone_path])
         os.chdir(clone_path)
 
 
@@ -442,24 +586,32 @@ def remote_caching_flags(platform):
 
 def remote_enabled(flags):
     # Detect if the project configuration enabled its own remote caching / execution.
-    remote_flags = ["--remote_executor", "--remote_cache", "--remote_http_cache"]
+    remote_flags = ["--remote_executor",
+                    "--remote_cache", "--remote_http_cache"]
     for flag in flags:
         for remote_flag in remote_flags:
             if flag.startswith(remote_flag):
                 return True
     return False
 
-def execute_bazel_build(bazel_binary, platform, flags, targets):
+
+def execute_bazel_build(bazel_binary, platform, flags, targets, bep_file):
     if not targets:
         return
     print_expanded_group("Build")
     num_jobs = str(multiprocessing.cpu_count())
     common_flags = ["--show_progress_rate_limit=5", "--curses=yes", "--color=yes", "--keep_going",
-                    "--jobs=" + num_jobs]
+                    "--jobs=" + num_jobs, "--build_event_json_file=" + bep_file,
+                    "--experimental_build_event_json_file_path_conversion=false"]
     caching_flags = []
     if not remote_enabled(flags):
         caching_flags = remote_caching_flags(platform)
-    execute_command([bazel_binary, "build"] + common_flags + caching_flags + flags + targets)
+    try:
+        execute_command([bazel_binary, "build"] +
+                        common_flags + caching_flags + flags + targets)
+    except subprocess.CalledProcessError as e:
+        raise BazelBuildFailedException(
+            "bazel build failed with exit code {}".format(e.returncode))
 
 
 def execute_bazel_test(bazel_binary, platform, flags, targets, bep_file):
@@ -476,9 +628,11 @@ def execute_bazel_test(bazel_binary, platform, flags, targets, bep_file):
     if not remote_enabled(flags):
         caching_flags = remote_caching_flags(platform)
     try:
-        execute_command([bazel_binary, "test"] + common_flags + caching_flags + flags + targets)
+        execute_command([bazel_binary, "test"] +
+                        common_flags + caching_flags + flags + targets)
     except subprocess.CalledProcessError as e:
-        raise BazelTestFailedException("bazel test failed with exit code {}".format(e.returncode))
+        raise BazelTestFailedException(
+            "bazel test failed with exit code {}".format(e.returncode))
 
 
 def upload_test_logs(bep_file, tmpdir):
@@ -490,7 +644,8 @@ def upload_test_logs(bep_file, tmpdir):
         try:
             os.chdir(tmpdir)
             print_collapsed_group("Uploading test logs")
-            execute_command(["buildkite-agent", "artifact", "upload", "*/**/*.log"])
+            execute_command(
+                ["buildkite-agent", "artifact", "upload", "*/**/*.log"])
         finally:
             os.chdir(cwd)
 
@@ -509,7 +664,6 @@ def test_logs_to_upload(bep_file, tmpdir):
         for test_log in test_logs:
             try:
                 new_path = test_label_to_path(tmpdir, label, attempt)
-                eprint("new_path: " + new_path)
                 os.makedirs(os.path.dirname(new_path), exist_ok=True)
                 copyfile(test_log, new_path)
                 new_paths.append(new_path)
@@ -549,7 +703,8 @@ def test_logs_for_status(bep_file, status):
                 outputs = bep_obj["testSummary"]["failed"]
                 test_logs = []
                 for output in outputs:
-                    test_logs.append(url2pathname(urlparse(output["uri"]).path))
+                    test_logs.append(url2pathname(
+                        urlparse(output["uri"]).path))
                 targets.append((test_target, test_logs))
         pos += size + 1
     return targets
@@ -560,11 +715,25 @@ def execute_command(args, shell=False, fail_if_nonzero=True):
     return subprocess.run(args, shell=shell, check=fail_if_nonzero).returncode
 
 
+def untrusted_code_verification_step():
+    return """
+  - block: \"Untrusted Code Verification\"
+    prompt: \"Did you review this pull request for malicious code?\""""
+
+
 def print_project_pipeline(platform_configs, project_name, http_config,
                            git_repository, use_but):
     pipeline_steps = []
+    if is_pull_request():
+        trusted_git_repository = git_repository
+        if not trusted_git_repository:
+            trusted_git_repository = os.getenv("BUILDKITE_REPO")
+        commit = os.getenv("BUILDKITE_COMMIT")
+        update_pull_request_verification_status(trusted_git_repository, commit, state="pending")
+        pipeline_steps.append(untrusted_code_verification_step())
     for platform, _ in platform_configs.items():
-        step = runner_step(platform, project_name, http_config, git_repository, use_but)
+        step = runner_step(platform, project_name,
+                           http_config, git_repository, use_but)
         pipeline_steps.append(step)
 
     print_pipeline(pipeline_steps)
@@ -572,7 +741,8 @@ def print_project_pipeline(platform_configs, project_name, http_config,
 
 def runner_step(platform, project_name=None, http_config=None,
                 git_repository=None, use_but=False):
-    command = python_binary(platform) + " bazelci.py runner --platform=" + platform
+    command = python_binary(platform) + \
+        " bazelci.py runner --platform=" + platform
     if http_config:
         command += " --http_config=" + http_config
     if git_repository:
@@ -626,7 +796,8 @@ def upload_project_pipeline_step(project_name, git_repository, http_config):
 
 def create_label(platform, project_name, build_only=False, test_only=False):
     if build_only and test_only:
-        raise BuildkiteException("build_only and test_only cannot be true at the same time")
+        raise BuildkiteException(
+            "build_only and test_only cannot be true at the same time")
     platform_name = platforms_info()[platform]["name"]
 
     if build_only:
@@ -674,20 +845,24 @@ def publish_bazel_binaries_step():
 
 def print_bazel_postsubmit_pipeline(configs, http_config):
     if not configs:
-        raise BuildkiteException("Bazel postsubmit pipeline configuration is empty.")
+        raise BuildkiteException(
+            "Bazel postsubmit pipeline configuration is empty.")
     if set(configs.keys()) != set(supported_platforms()):
-        raise BuildkiteException("Bazel postsubmit pipeline needs to build Bazel on all supported platforms.")
+        raise BuildkiteException(
+            "Bazel postsubmit pipeline needs to build Bazel on all supported platforms.")
 
     pipeline_steps = []
     for platform, config in configs.items():
-        pipeline_steps.append(bazel_build_step(platform, "Bazel", http_config, build_only=True))
+        pipeline_steps.append(bazel_build_step(
+            platform, "Bazel", http_config, build_only=True))
     pipeline_steps.append(wait_step())
 
     # todo move this to the end with a wait step.
     pipeline_steps.append(publish_bazel_binaries_step())
 
     for platform, config in configs.items():
-        pipeline_steps.append(bazel_build_step(platform, "Bazel", http_config, test_only=True))
+        pipeline_steps.append(bazel_build_step(
+            platform, "Bazel", http_config, test_only=True))
 
     for project, config in downstream_projects().items():
         git_repository = config["git_repository"]
@@ -718,12 +893,14 @@ def latest_generation_and_build_number():
             ["gsutil", "stat", bazelci_builds_metadata_url()])
         match = re.search("Generation:[ ]*([0-9]+)", output.decode("utf-8"))
         if not match:
-            raise BuildkiteException("Couldn't parse generation. gsutil output format changed?")
+            raise BuildkiteException(
+                "Couldn't parse generation. gsutil output format changed?")
         generation = match.group(1)
 
         match = re.search(r"Hash \(md5\):[ ]*([^\s]+)", output.decode("utf-8"))
         if not match:
-            raise BuildkiteException("Couldn't parse md5 hash. gsutil output format changed?")
+            raise BuildkiteException(
+                "Couldn't parse md5 hash. gsutil output format changed?")
         expected_md5hash = base64.b64decode(match.group(1))
 
         output = subprocess.check_output(
@@ -809,18 +986,21 @@ def publish_binaries():
                .format(bazelci_builds_metadata_url(), current_build_number))
         break
     else:
-        raise BuildkiteException("Could not publish binaries, ran out of attempts.")
+        raise BuildkiteException(
+            "Could not publish binaries, ran out of attempts.")
 
 
 def main(argv=None):
     if argv is None:
         argv = sys.argv
 
-    parser = argparse.ArgumentParser(description='Bazel Continuous Integration Script')
+    parser = argparse.ArgumentParser(
+        description='Bazel Continuous Integration Script')
 
     subparsers = parser.add_subparsers(dest="subparsers_name")
 
-    bazel_postsubmit_pipeline = subparsers.add_parser("bazel_postsubmit_pipeline")
+    bazel_postsubmit_pipeline = subparsers.add_parser(
+        "bazel_postsubmit_pipeline")
     bazel_postsubmit_pipeline.add_argument("--http_config", type=str)
     bazel_postsubmit_pipeline.add_argument("--git_repository", type=str)
 
@@ -828,10 +1008,12 @@ def main(argv=None):
     project_pipeline.add_argument("--project_name", type=str)
     project_pipeline.add_argument("--http_config", type=str)
     project_pipeline.add_argument("--git_repository", type=str)
-    project_pipeline.add_argument("--use_but", type=bool, nargs="?", const=True)
+    project_pipeline.add_argument(
+        "--use_but", type=bool, nargs="?", const=True)
 
     runner = subparsers.add_parser("runner")
-    runner.add_argument("--platform", action="store", choices=list(supported_platforms()))
+    runner.add_argument("--platform", action="store",
+                        choices=list(supported_platforms()))
     runner.add_argument("--http_config", type=str)
     runner.add_argument("--git_repository", type=str)
     runner.add_argument("--use_but", type=bool, nargs="?", const=True)
@@ -846,7 +1028,8 @@ def main(argv=None):
     try:
         if args.subparsers_name == "bazel_postsubmit_pipeline":
             configs = fetch_configs(args.http_config)
-            print_bazel_postsubmit_pipeline(configs.get("platforms", None), args.http_config)
+            print_bazel_postsubmit_pipeline(
+                configs.get("platforms", None), args.http_config)
         elif args.subparsers_name == "project_pipeline":
             configs = fetch_configs(args.http_config)
             print_project_pipeline(configs.get("platforms", None), args.project_name,
@@ -865,6 +1048,7 @@ def main(argv=None):
         eprint(str(e))
         return 1
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
